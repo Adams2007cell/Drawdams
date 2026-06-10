@@ -3,6 +3,11 @@ import { useRef, useState, useEffect, useCallback } from 'react';
 /* ================================================================
    DRAWDAMS — Board Component
    Infinite digital whiteboard canvas engine
+   
+   Fixes in this version:
+   - Eraser now truly erases (compositing fixed)
+   - Paste image from clipboard (Ctrl+V)
+   - Math symbols panel with LaTeX-style symbols
 ================================================================ */
 
 // ── Types ──
@@ -30,9 +35,23 @@ const BG_PRESETS = [
   { bg:'#2d4a3e', label:'Verde pizarrón', dark:true, canvasBg:'#2d4a3e' },
 ];
 
+// ── Math symbol categories ──
+const MATH_SYMBOLS = [
+  { label: 'Básicos', symbols: ['+','−','×','÷','=','≠','±','∓','·','∶','∷','∸'] },
+  { label: 'Relación', symbols: ['<','>','≤','≥','≪','≫','≈','≡','∝','∼','≅','≃'] },
+  { label: 'Conjuntos', symbols: ['∈','∉','⊂','⊃','⊆','⊇','∅','∪','∩','∖','△','⊕'] },
+  { label: 'Lógica', symbols: ['∧','∨','¬','⊤','⊥','∀','∃','∄','⊢','⊨','⟹','⟺'] },
+  { label: 'Cálculo', symbols: ['∫','∬','∭','∮','∯','∂','∇','∆','∑','∏','lim','∞'] },
+  { label: 'Potencias', symbols: ['²','³','⁴','⁵','⁶','⁷','⁸','⁹','ⁿ','⁻¹','√','∛'] },
+  { label: 'Fracciones', symbols: ['½','⅓','⅔','¼','¾','⅛','⅜','⅝','⅞','⅙','⅚','⅕'] },
+  { label: 'Griegos', symbols: ['α','β','γ','δ','ε','θ','λ','μ','π','σ','φ','ω'] },
+  { label: 'Griegos May.', symbols: ['Α','Β','Γ','Δ','Ε','Θ','Λ','Μ','Π','Σ','Φ','Ω'] },
+  { label: 'Geom./Otros', symbols: ['°','′','″','⊥','∥','∠','△','▲','◇','□','⬡','∗'] },
+];
+
 export default function Board({ user, onLogout }: { user: UserData; onLogout: () => void }) {
   // ══════════════════════════════════════════════════════════════
-  // STATE (triggers UI re-renders)
+  // STATE
   // ══════════════════════════════════════════════════════════════
   const [tool, setTool] = useState('pen');
   const [darkMode, setDarkMode] = useState(false);
@@ -51,17 +70,18 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
   const [selIdx, setSelIdx] = useState(-1);
   const [textOverlay, setTextOverlay] = useState<{left:number;top:number;cx:number;cy:number}|null>(null);
   const [toastMsg, setToastMsg] = useState('');
+  const [showMathPanel, setShowMathPanel] = useState(false);
+  const [mathCat, setMathCat] = useState(0);
   const toastTimer = useRef(0);
 
   // ══════════════════════════════════════════════════════════════
-  // REFS (mutable, no re-renders)
+  // REFS
   // ══════════════════════════════════════════════════════════════
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textAreaRef = useRef<HTMLTextAreaElement>(null);
 
-  // Canvas engine refs
   const vp = useRef({ x: 0, y: 0, scale: 1 });
   const els = useRef<DrawElement[]>([]);
   const undoStack = useRef<string[]>([]);
@@ -93,13 +113,14 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
   const fontStR = useRef(fontSt);
   const selIdxR = useRef(selIdx);
 
-  // Function refs (populated by canvas useEffect, called by UI)
+  // Function refs
   const redrawFn = useRef(()=>{});
   const pushUndoFn = useRef(()=>{});
   const undoFn = useRef(()=>{});
   const redoFn = useRef(()=>{});
   const resetViewFn = useRef(()=>{});
   const loadImageFn = useRef((_f:File)=>{});
+  const loadImageDataURLFn = useRef((_src:string)=>{});
   const commitTextFn = useRef(()=>{});
   const setCursorFn = useRef((_c:string)=>{});
 
@@ -147,7 +168,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
   }),[]);
 
   // ══════════════════════════════════════════════════════════════
-  // MAIN CANVAS ENGINE (useEffect — runs once)
+  // MAIN CANVAS ENGINE
   // ══════════════════════════════════════════════════════════════
   useEffect(()=>{
     const canvas = canvasRef.current;
@@ -155,14 +176,12 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
     if(!canvas||!wrap) return;
     const ctx = canvas.getContext('2d')!;
 
-    // ── Pointer position helper ──
     function ptr(e:PointerEvent){
       const r=canvas!.getBoundingClientRect();
       const sx=e.clientX-r.left, sy=e.clientY-r.top;
       return {sx,sy,...s2c(sx,sy)};
     }
 
-    // ── Resize ──
     function resize(){
       canvas!.width = wrap!.clientWidth;
       canvas!.height = wrap!.clientHeight;
@@ -197,7 +216,10 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
       }
     }
 
-    // ── Render element to context ──
+    // ── Render a single element ──
+    // NOTE: eraser uses destination-out, so it must be drawn AFTER the background
+    // on a canvas that already has the background painted. We render directly on
+    // the main canvas (not an offscreen), which is why drawBg() is called first.
     function renderEl(c:CanvasRenderingContext2D, el:DrawElement){
       c.save();
       c.globalAlpha=el.opacity??1;
@@ -220,12 +242,18 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
           c.lineTo(last.x,last.y); c.stroke(); break;
         }
         case 'eraser':{
+          // ── ERASER FIX: use destination-out to cut through drawn content ──
+          // This works because we draw the solid background first, then elements,
+          // so destination-out removes pixels back to the bg color (canvas default).
           const pts=el.points; if(!pts||pts.length<1) break;
-          c.globalCompositeOperation='destination-out'; c.globalAlpha=1;
+          c.globalCompositeOperation='destination-out';
+          c.globalAlpha=1;
+          c.strokeStyle='rgba(0,0,0,1)';
+          c.fillStyle='rgba(0,0,0,1)';
           c.lineWidth=(el.lineWidth??20)*vp.current.scale;
           if(pts.length===1){
             const p=c2s(pts[0].x,pts[0].y);
-            c.beginPath();c.arc(p.x,p.y,c.lineWidth/2,0,Math.PI*2);c.fill();
+            c.beginPath();c.arc(p.x,p.y,(el.lineWidth??20)*vp.current.scale/2,0,Math.PI*2);c.fill();
           } else {
             c.beginPath();
             const p0=c2s(pts[0].x,pts[0].y); c.moveTo(p0.x,p0.y);
@@ -313,15 +341,14 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
       ctx!.restore();
     }
 
-    // ── Full redraw ──
+    // ── Full redraw (FIXED: background first, then elements directly on main ctx) ──
     function doRedraw(){
-      const off=document.createElement('canvas');
-      off.width=canvas!.width; off.height=canvas!.height;
-      const oc=off.getContext('2d')!;
-      els.current.forEach(el=>renderEl(oc,el));
-      if(cur.current) renderEl(oc,cur.current);
+      // 1. Draw the background (fills canvas with solid color + dots/grid)
       drawBg();
-      ctx!.drawImage(off,0,0);
+      // 2. Draw all elements directly on the main canvas so eraser destination-out works
+      els.current.forEach(el=>renderEl(ctx!,el));
+      if(cur.current) renderEl(ctx!,cur.current);
+      // 3. Draw selection overlay on top
       if(selIdxR.current>=0&&selIdxR.current<els.current.length)
         renderSel(els.current[selIdxR.current]);
     }
@@ -403,8 +430,8 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
       const right=bb.x+bb.w, bottom=bb.y+bb.h;
       if(handle.includes('e')) el.w=x-el.x!;
       if(handle.includes('s')) el.h=y-el.y!;
-      if(handle.includes('w')){el.x!=x;el.w=right-x;}
-      if(handle.includes('n')){el.y!=y;el.h=bottom-y;}
+      if(handle.includes('w')){el.x=x;el.w=right-x;}
+      if(handle.includes('n')){el.y=y;el.h=bottom-y;}
     }
 
     // ── Serialize / Deserialize ──
@@ -466,6 +493,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
     setCursorFn.current=(c:string)=>{canvas!.style.cursor=c;};
 
     // ── Commit text ──
+    let textOverlayState = { cx:0, cy:0 };
     function commitText(){
       const ta=textAreaRef.current;
       if(!ta) return;
@@ -482,15 +510,100 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
     }
     commitTextFn.current=commitText;
 
-    // We need to store text overlay position for the commit function
-    let textOverlayState = { cx:0, cy:0 };
+    // ── Reset view ──
+    function resetView(){
+      vp.current={x:0,y:0,scale:1};
+      doRedraw();
+      showToastR.current('Vista restablecida');
+    }
+    resetViewFn.current=resetView;
+
+    // ── Cycle background ──
+    function cycleBg(){
+      bgIdx.current=(bgIdx.current+1)%BG_PRESETS.length;
+      const preset=BG_PRESETS[bgIdx.current];
+      setDarkMode(preset.dark); darkR.current=preset.dark;
+      document.documentElement.setAttribute('data-theme',preset.dark?'dark':'light');
+      doRedraw();
+      showToastR.current('🎨 Fondo: '+preset.label);
+    }
+
+    // ── Save / Load ──
+    function saveBoard(){
+      const data={version:'1.0',vp:{...vp.current},bgIdx:bgIdx.current,
+        elements:els.current.map(el=>{const c={...el};if(c.imgEl){c._src=c.imgEl.src;delete c.imgEl;}return c;})};
+      try{
+        localStorage.setItem('drawdams_v1',JSON.stringify(data));
+        showToastR.current('💾 Guardado');
+      }catch(err){showToastR.current('❌ Error al guardar');}
+    }
+
+    function loadBoard(){
+      const raw=localStorage.getItem('drawdams_v1');
+      if(!raw){showToastR.current('📂 No hay datos guardados');return;}
+      try{
+        const data=JSON.parse(raw);
+        vp.current=data.vp||{x:0,y:0,scale:1};
+        bgIdx.current=data.bgIdx||0;
+        const preset=BG_PRESETS[bgIdx.current];
+        setDarkMode(preset.dark); darkR.current=preset.dark;
+        document.documentElement.setAttribute('data-theme',preset.dark?'dark':'light');
+        els.current=(data.elements||[]).map((el:DrawElement)=>{
+          if(el._src){const img=new Image();img.src=el._src;img.onload=()=>doRedraw();el.imgEl=img;delete el._src;}
+          return el;
+        });
+        undoStack.current=[]; redoStack.current=[];
+        selIdxR.current=-1; setSelIdx(-1);
+        doRedraw();
+        showToastR.current('📂 Cargado');
+      }catch(err){showToastR.current('❌ Error al cargar');}
+    }
+
+    // ── Delete selected ──
+    function deleteSelected(){
+      if(selIdxR.current<0) return;
+      pushUndo();
+      els.current.splice(selIdxR.current,1);
+      selIdxR.current=-1; setSelIdx(-1);
+      doRedraw();
+      showToastR.current('✕ Eliminado');
+    }
+
+    // ── Load image from File ──
+    function loadImageFile(file:File){
+      const reader=new FileReader();
+      reader.onload=ev=>{
+        loadImageFromDataURL(ev.target?.result as string);
+      };
+      reader.readAsDataURL(file);
+    }
+    loadImageFn.current=loadImageFile;
+
+    // ── Load image from data URL (used for file AND clipboard paste) ──
+    function loadImageFromDataURL(src:string){
+      const imgEl=new Image();
+      imgEl.onload=()=>{
+        const center=s2c(canvas!.width/2,canvas!.height/2);
+        const MAX=500;
+        let w=imgEl.width,h=imgEl.height;
+        if(w>MAX){h=h*MAX/w;w=MAX;} if(h>MAX){w=w*MAX/h;h=MAX;}
+        pushUndo();
+        els.current.push({type:'image',imgEl,x:center.x-w/2,y:center.y-h/2,w,h,
+          stroke:'#000',fill:'transparent',useFill:false,lineWidth:1,opacity:1});
+        setTool('select'); toolR.current='select';
+        selIdxR.current=els.current.length-1; setSelIdx(els.current.length-1);
+        doRedraw();
+        showToastR.current('Imagen añadida 🖼️');
+      };
+      imgEl.src=src;
+    }
+    loadImageDataURLFn.current=loadImageFromDataURL;
 
     // ═══ POINTER EVENTS ═══
     function onPointerDown(e:PointerEvent){
       canvas!.setPointerCapture(e.pointerId);
       const {sx,sy,x,y}=ptr(e);
 
-      // Panning
       if(e.button===1||(e.button===0&&spaceDown.current)){
         isPanning.current=true;
         panOrigin.current={x:sx-vp.current.x,y:sy-vp.current.y};
@@ -498,13 +611,11 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
       }
       if(e.button!==0) return;
 
-      // Commit open text (via ref to avoid stale closure)
       if(toolR.current!=='text'){
         commitTextFn.current();
         setTextOverlay(null);
       }
 
-      // Select tool
       if(toolR.current==='select'){
         if(selIdxR.current>=0){
           const h=hitHandle(els.current[selIdxR.current],sx,sy);
@@ -525,7 +636,6 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
         doRedraw(); return;
       }
 
-      // Text tool
       if(toolR.current==='text'){
         const sc=c2s(x,y);
         const wr=wrap!.getBoundingClientRect();
@@ -535,7 +645,6 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
         return;
       }
 
-      // Drawing tools
       isDrawing.current=true;
       rawPts.current=[{x,y}];
 
@@ -554,7 +663,6 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
     function onPointerMove(e:PointerEvent){
       const {sx,sy,x,y}=ptr(e);
 
-      // Handle hover for select tool
       if(toolR.current==='select'&&selIdxR.current>=0&&!isDrawing.current){
         const h=hitHandle(els.current[selIdxR.current],sx,sy);
         if(h){
@@ -626,9 +734,8 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
       if(toolR.current==='select') return;
       if(!cur.current) return;
 
-      // Validate minimum size
       if(['pen','eraser'].includes(cur.current.type)){
-        if(!cur.current.points||cur.current.points.length<2){cur.current=null;return;}
+        if(!cur.current.points||cur.current.points.length<2){cur.current=null;doRedraw();return;}
         cur.current.points=smoothPts(rawPts.current,smoothR.current);
       }
       if(['rect','circle','triangle'].includes(cur.current.type)){
@@ -698,88 +805,30 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
       }
     }
 
-    // ── Reset view ──
-    function resetView(){
-      vp.current={x:0,y:0,scale:1};
-      doRedraw();
-      showToastR.current('Vista restablecida');
-    }
-    resetViewFn.current=resetView;
-
-    // ── Cycle background ──
-    function cycleBg(){
-      bgIdx.current=(bgIdx.current+1)%BG_PRESETS.length;
-      const preset=BG_PRESETS[bgIdx.current];
-      setDarkMode(preset.dark); darkR.current=preset.dark;
-      document.documentElement.setAttribute('data-theme',preset.dark?'dark':'light');
-      doRedraw();
-      showToastR.current('🎨 Fondo: '+preset.label);
+    // ═══ PASTE FROM CLIPBOARD ═══
+    function onPaste(e:ClipboardEvent){
+      const tag=(document.activeElement?.tagName)??'';
+      if(tag==='TEXTAREA'||tag==='INPUT') return;
+      const items=e.clipboardData?.items;
+      if(!items) return;
+      for(let i=0;i<items.length;i++){
+        if(items[i].type.startsWith('image/')){
+          e.preventDefault();
+          const file=items[i].getAsFile();
+          if(file) loadImageFile(file);
+          return;
+        }
+      }
     }
 
-    // ── Save / Load ──
-    function saveBoard(){
-      const data={version:'1.0',vp:{...vp.current},bgIdx:bgIdx.current,
-        elements:els.current.map(el=>{const c={...el};if(c.imgEl){c._src=c.imgEl.src;delete c.imgEl;}return c;})};
-      try{
-        localStorage.setItem('drawdams_v1',JSON.stringify(data));
-        showToastR.current('💾 Guardado');
-      }catch(err){showToastR.current('❌ Error al guardar');}
+    // ═══ DRAG & DROP ═══
+    function onDragOver(e:DragEvent){e.preventDefault();wrap!.style.outline='3px dashed var(--accent)';}
+    function onDragLeave(){wrap!.style.outline='';}
+    function onDrop(e:DragEvent){
+      e.preventDefault();wrap!.style.outline='';
+      const file=[...e.dataTransfer!.files].find(f=>f.type.startsWith('image/'));
+      if(file) loadImageFile(file);
     }
-
-    function loadBoard(){
-      const raw=localStorage.getItem('drawdams_v1');
-      if(!raw){showToastR.current('📂 No hay datos guardados');return;}
-      try{
-        const data=JSON.parse(raw);
-        vp.current=data.vp||{x:0,y:0,scale:1};
-        bgIdx.current=data.bgIdx||0;
-        const preset=BG_PRESETS[bgIdx.current];
-        setDarkMode(preset.dark); darkR.current=preset.dark;
-        document.documentElement.setAttribute('data-theme',preset.dark?'dark':'light');
-        els.current=(data.elements||[]).map((el:DrawElement)=>{
-          if(el._src){const img=new Image();img.src=el._src;img.onload=()=>doRedraw();el.imgEl=img;delete el._src;}
-          return el;
-        });
-        undoStack.current=[]; redoStack.current=[];
-        selIdxR.current=-1; setSelIdx(-1);
-        doRedraw();
-        showToastR.current('📂 Cargado');
-      }catch(err){showToastR.current('❌ Error al cargar');}
-    }
-
-    // ── Delete selected ──
-    function deleteSelected(){
-      if(selIdxR.current<0) return;
-      pushUndo();
-      els.current.splice(selIdxR.current,1);
-      selIdxR.current=-1; setSelIdx(-1);
-      doRedraw();
-      showToastR.current('✕ Eliminado');
-    }
-
-    // ── Load image file ──
-    function loadImageFile(file:File){
-      const reader=new FileReader();
-      reader.onload=ev=>{
-        const imgEl=new Image();
-        imgEl.onload=()=>{
-          const center=s2c(canvas!.width/2,canvas!.height/2);
-          const MAX=500;
-          let w=imgEl.width,h=imgEl.height;
-          if(w>MAX){h=h*MAX/w;w=MAX;} if(h>MAX){w=w*MAX/h;h=MAX;}
-          pushUndo();
-          els.current.push({type:'image',imgEl,x:center.x-w/2,y:center.y-h/2,w,h,
-            stroke:'#000',fill:'transparent',useFill:false,lineWidth:1,opacity:1});
-          setTool('select'); toolR.current='select';
-          selIdxR.current=els.current.length-1; setSelIdx(els.current.length-1);
-          doRedraw();
-          showToastR.current('Imagen añadida 🖼️');
-        };
-        imgEl.src=ev.target?.result as string;
-      };
-      reader.readAsDataURL(file);
-    }
-    loadImageFn.current=loadImageFile;
 
     // ═══ ATTACH EVENTS ═══
     resize();
@@ -791,15 +840,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
     canvas.addEventListener('wheel',onWheel,{passive:false});
     document.addEventListener('keydown',onKeyDown);
     document.addEventListener('keyup',onKeyUp);
-
-    // Drag & drop
-    function onDragOver(e:DragEvent){e.preventDefault();wrap!.style.outline='3px dashed var(--accent)';}
-    function onDragLeave(){wrap!.style.outline='';}
-    function onDrop(e:DragEvent){
-      e.preventDefault();wrap!.style.outline='';
-      const file=[...e.dataTransfer!.files].find(f=>f.type.startsWith('image/'));
-      if(file) loadImageFile(file);
-    }
+    document.addEventListener('paste',onPaste);
     wrap.addEventListener('dragover',onDragOver);
     wrap.addEventListener('dragleave',onDragLeave);
     wrap.addEventListener('drop',onDrop);
@@ -814,7 +855,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
       const cx=canvas.width/2,cy=canvas.height/2;
       const c=s2c(cx,cy);
       els.current.push({
-        type:'text',text:'¡Bienvenido a Drawdams! ✏️\nElige una herramienta y empieza a crear.\nD = cambiar fondo · Ctrl+Z = deshacer · Rueda = zoom',
+        type:'text',text:'¡Bienvenido a Drawdams! ✏️\nElige una herramienta y empieza a crear.\nD = cambiar fondo · Ctrl+Z = deshacer · Rueda = zoom · Ctrl+V = pegar imagen',
         x:c.x-280,y:c.y-50,
         stroke:'#6b7280',fill:'transparent',useFill:false,lineWidth:1,opacity:0.7,
         fontFamily:"'Inter',sans-serif",fontSize:15,fontStyle:'normal',
@@ -831,6 +872,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
       canvas.removeEventListener('wheel',onWheel);
       document.removeEventListener('keydown',onKeyDown);
       document.removeEventListener('keyup',onKeyUp);
+      document.removeEventListener('paste',onPaste);
       wrap.removeEventListener('dragover',onDragOver);
       wrap.removeEventListener('dragleave',onDragLeave);
       wrap.removeEventListener('drop',onDrop);
@@ -861,7 +903,6 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
     const preset=BG_PRESETS[bgIdx.current];
     ec.fillStyle=preset.canvasBg;
     ec.fillRect(0,0,exp.width,exp.height);
-    // Reuse the renderEl from engine — we'll just draw from the main canvas
     ec.drawImage(canvas,0,0);
     exp.toBlob(blob=>{
       if(!blob) return;
@@ -889,7 +930,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
       switch(el.type){
         case 'pen':{
           if(!el.points?.length) break;
-          let d=el.points.map((p,i)=>{const s=c2sFn(p.x,p.y);return i===0?`M${s.x.toFixed(1)},${s.y.toFixed(1)}`:`L${s.x.toFixed(1)},${s.y.toFixed(1)}`;}).join(' ');
+          const d=el.points.map((p,i)=>{const s=c2sFn(p.x,p.y);return i===0?`M${s.x.toFixed(1)},${s.y.toFixed(1)}`:`L${s.x.toFixed(1)},${s.y.toFixed(1)}`;}).join(' ');
           svg+=`<path d="${d}" stroke="${st}" stroke-width="${sw}" fill="none" opacity="${al}" stroke-linecap="round" stroke-linejoin="round"/>`; break;
         }
         case 'line':case 'arrow':{
@@ -930,8 +971,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
   },[showToast]);
 
   const handleSaveToDrive = useCallback(()=>{
-    showToast('☁️ Subiendo a Google Drive...');
-    setTimeout(()=>showToast('✓ Guardado en carpeta "Drawdams" de Google Drive'),2000);
+    showToast('☁️ Sube a Drive: exporta PNG y guárdalo manualmente');
   },[showToast]);
 
   const handleClear = useCallback(()=>{
@@ -984,6 +1024,38 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
       setTextOverlay(null);
     }
   },[]);
+
+  // Insert math symbol into active text area or as new text element
+  const handleInsertSymbol = useCallback((sym:string)=>{
+    const ta=textAreaRef.current;
+    if(ta&&textOverlay){
+      const start=ta.selectionStart??ta.value.length;
+      const end=ta.selectionEnd??ta.value.length;
+      const newVal=ta.value.slice(0,start)+sym+ta.value.slice(end);
+      ta.value=newVal;
+      const pos=start+sym.length;
+      ta.setSelectionRange(pos,pos);
+      ta.focus();
+    } else {
+      // Place as new text in the center of the canvas
+      const canvas=canvasRef.current;
+      if(!canvas) return;
+      const center=((vp:any)=>({
+        x:(canvas.width/2-vp.x)/vp.scale,
+        y:(canvas.height/2-vp.y)/vp.scale,
+      }))(vp.current);
+      pushUndoFn.current();
+      els.current.push({
+        type:'text',text:sym,
+        x:center.x,y:center.y,
+        stroke:strokeColor,fill:'transparent',useFill:false,
+        lineWidth:1,opacity:opacityVal/100,
+        fontFamily:fontFam,fontSize:fontSz*2,fontStyle:fontSt,
+      });
+      redrawFn.current();
+      showToast(`Símbolo ${sym} añadido`);
+    }
+  },[textOverlay,strokeColor,opacityVal,fontFam,fontSz,fontSt,showToast]);
 
   // Selection bar actions
   const handleSelDup = useCallback(()=>{
@@ -1093,7 +1165,14 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
 
         <button className="tb-btn" onClick={()=>fileInputRef.current?.click()} aria-label="Subir imagen">
           <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
-          <span className="tip">Imagen <kbd>I</kbd></span>
+          <span className="tip">Imagen <kbd>I</kbd> / Ctrl+V</span>
+        </button>
+
+        {/* Math symbols button */}
+        <button className={`tb-btn ${showMathPanel?'active':''}`}
+          onClick={()=>setShowMathPanel(p=>!p)} aria-label="Símbolos matemáticos">
+          <span style={{fontSize:15,fontWeight:700,fontFamily:'serif'}}>∑</span>
+          <span className="tip">Símbolos matemáticos</span>
         </button>
 
         <div className="tb-spacer"/>
@@ -1140,6 +1219,35 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
         <button className="logout-btn" onClick={onLogout}>Salir</button>
       </div>
 
+      {/* ═══ MATH SYMBOLS PANEL ═══ */}
+      {showMathPanel&&(
+        <div className="math-panel">
+          <div className="math-panel-header">
+            <span style={{fontWeight:600,fontSize:13}}>Símbolos matemáticos</span>
+            <button className="modal-close-btn" style={{width:24,height:24,fontSize:13}}
+              onClick={()=>setShowMathPanel(false)}>✕</button>
+          </div>
+          <div className="math-cats">
+            {MATH_SYMBOLS.map((cat,i)=>(
+              <button key={i} className={`math-cat-btn ${mathCat===i?'active':''}`}
+                onClick={()=>setMathCat(i)}>{cat.label}</button>
+            ))}
+          </div>
+          <div className="math-grid">
+            {MATH_SYMBOLS[mathCat].symbols.map((sym,i)=>(
+              <button key={i} className="math-sym-btn"
+                title={`Insertar ${sym}`}
+                onClick={()=>handleInsertSymbol(sym)}>
+                {sym}
+              </button>
+            ))}
+          </div>
+          <div style={{padding:'6px 10px',fontSize:10,color:'var(--text2)',borderTop:'1px solid var(--border)'}}>
+            {textOverlay ? 'Se insertará en el texto activo' : 'Se colocará en el centro del lienzo'}
+          </div>
+        </div>
+      )}
+
       {/* ═══ RIGHT PANEL ═══ */}
       <div className="panel" role="complementary" aria-label="Propiedades">
 
@@ -1159,7 +1267,6 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
             </div>
           </div>
 
-          {/* Quick palette for text color */}
           {(tool==='text')&&(
             <div style={{marginTop:8}}>
               <div style={{fontSize:10,color:'var(--text2)',marginBottom:4}}>Color de texto</div>
@@ -1173,7 +1280,6 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
             </div>
           )}
 
-          {/* Quick palette for shape stroke */}
           {['rect','circle','triangle','line','arrow'].includes(tool)&&(
             <div style={{marginTop:8}}>
               <div style={{fontSize:10,color:'var(--text2)',marginBottom:4}}>Color de contorno</div>
@@ -1187,7 +1293,6 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
             </div>
           )}
 
-          {/* Fill palette */}
           {['rect','circle','triangle'].includes(tool)&&(
             <div style={{marginTop:8}}>
               <div style={{fontSize:10,color:'var(--text2)',marginBottom:4}}>Color de relleno</div>
@@ -1288,9 +1393,17 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
           </div>
         </div>
 
+        {/* Google Drive info */}
+        <div className="panel-section">
+          <div className="pn-title" style={{color:'var(--text2)'}}>Google Drive</div>
+          <div style={{fontSize:10,color:'var(--text2)',lineHeight:1.6}}>
+            Para guardar en Drive automáticamente necesitas una <b>API Key de Google</b>. Exporta el PNG y súbelo manualmente por ahora. <a href="https://console.cloud.google.com" target="_blank" rel="noreferrer" style={{color:'var(--accent)'}}>Crear proyecto</a>
+          </div>
+        </div>
+
         {/* Footer */}
         <div className="panel-footer">
-          <strong>Drawdams v1.0</strong><br/>
+          <strong>Drawdams v1.1</strong><br/>
           Código abierto · Licencia MIT<br/>
           <a href="https://github.com/drawdams" target="_blank" rel="noreferrer">★ GitHub</a>
         </div>
@@ -1335,8 +1448,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
           <span className="sc-tag"><span className="key">Ctrl+Y</span> Rehacer</span>
           <span className="sc-tag"><span className="key">Espacio+Arrastrar</span> Mover lienzo</span>
           <span className="sc-tag"><span className="key">Scroll</span> Zoom</span>
-          <span className="sc-tag"><span className="key">Ctrl+S</span> Guardar</span>
-          <span className="sc-tag"><span className="key">Shift</span> Proporciones</span>
+          <span className="sc-tag"><span className="key">Ctrl+V</span> Pegar imagen</span>
           <button className="sb-toggle" onClick={()=>setShowSB(false)} title="Ocultar">✕</button>
         </div>
       )}
@@ -1368,6 +1480,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
               <div className="sc-item"><span className="key">A</span>Flecha</div>
               <div className="sc-item"><span className="key">G</span>Triángulo</div>
               <div className="sc-item"><span className="key">I</span>Subir imagen</div>
+              <div className="sc-item"><span className="key">Ctrl+V</span>Pegar imagen</div>
               <div className="sc-item"><span className="key">Ctrl Z</span>Deshacer</div>
               <div className="sc-item"><span className="key">Ctrl Y</span>Rehacer</div>
               <div className="sc-item"><span className="key">Ctrl S</span>Guardar</div>
@@ -1377,7 +1490,6 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
               <div className="sc-item"><span className="key">Rueda</span>Zoom</div>
               <div className="sc-item"><span className="key">Espacio+drag</span>Paneo</div>
               <div className="sc-item"><span className="key">Ctrl+Enter</span>Confirmar texto</div>
-              <div className="sc-item"><span className="key">Shift</span>Proporciones</div>
               <div className="sc-item"><span className="key">0</span>Restablecer vista</div>
             </div>
           </div>
