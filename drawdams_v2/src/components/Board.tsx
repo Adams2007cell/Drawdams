@@ -3,6 +3,11 @@ import { useRef, useState, useEffect, useCallback } from 'react';
 /* ================================================================
    DRAWDAMS — Board Component
    Infinite digital whiteboard canvas engine
+   
+   Fixes in this version:
+   - Eraser now truly erases (compositing fixed)
+   - Paste image from clipboard (Ctrl+V)
+   - Math symbols panel with LaTeX-style symbols
 ================================================================ */
 
 // ── Types ──
@@ -30,9 +35,23 @@ const BG_PRESETS = [
   { bg:'#2d4a3e', label:'Verde pizarrón', dark:true, canvasBg:'#2d4a3e' },
 ];
 
+// ── Math symbol categories ──
+const MATH_SYMBOLS = [
+  { label: 'Básicos', symbols: ['+','−','×','÷','=','≠','±','∓','·','∶','∷','∸'] },
+  { label: 'Relación', symbols: ['<','>','≤','≥','≪','≫','≈','≡','∝','∼','≅','≃'] },
+  { label: 'Conjuntos', symbols: ['∈','∉','⊂','⊃','⊆','⊇','∅','∪','∩','∖','△','⊕'] },
+  { label: 'Lógica', symbols: ['∧','∨','¬','⊤','⊥','∀','∃','∄','⊢','⊨','⟹','⟺'] },
+  { label: 'Cálculo', symbols: ['∫','∬','∭','∮','∯','∂','∇','∆','∑','∏','lim','∞'] },
+  { label: 'Potencias', symbols: ['²','³','⁴','⁵','⁶','⁷','⁸','⁹','ⁿ','⁻¹','√','∛'] },
+  { label: 'Fracciones', symbols: ['½','⅓','⅔','¼','¾','⅛','⅜','⅝','⅞','⅙','⅚','⅕'] },
+  { label: 'Griegos', symbols: ['α','β','γ','δ','ε','θ','λ','μ','π','σ','φ','ω'] },
+  { label: 'Griegos May.', symbols: ['Α','Β','Γ','Δ','Ε','Θ','Λ','Μ','Π','Σ','Φ','Ω'] },
+  { label: 'Geom./Otros', symbols: ['°','′','″','⊥','∥','∠','△','▲','◇','□','⬡','∗'] },
+];
+
 export default function Board({ user, onLogout }: { user: UserData; onLogout: () => void }) {
   // ══════════════════════════════════════════════════════════════
-  // STATE (triggers UI re-renders)
+  // STATE
   // ══════════════════════════════════════════════════════════════
   const [tool, setTool] = useState('pen');
   const [darkMode, setDarkMode] = useState(false);
@@ -51,20 +70,18 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
   const [selIdx, setSelIdx] = useState(-1);
   const [textOverlay, setTextOverlay] = useState<{left:number;top:number;cx:number;cy:number}|null>(null);
   const [toastMsg, setToastMsg] = useState('');
+  const [showMathPanel, setShowMathPanel] = useState(false);
+  const [mathCat, setMathCat] = useState(0);
   const toastTimer = useRef(0);
 
   // ══════════════════════════════════════════════════════════════
-  // REFS (mutable, no re-renders)
+  // REFS
   // ══════════════════════════════════════════════════════════════
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textAreaRef = useRef<HTMLTextAreaElement>(null);
-  const editingTextIdxRef = useRef(-1);
-  const lastClickTimeRef = useRef(0);
-  const lastClickIdxRef = useRef(-1);
 
-  // Canvas engine refs
   const vp = useRef({ x: 0, y: 0, scale: 1 });
   const els = useRef<DrawElement[]>([]);
   const undoStack = useRef<string[]>([]);
@@ -80,6 +97,8 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
   const rHandle = useRef('');
   const rBBox = useRef<any>(null);
   const bgIdx = useRef(0);
+  const editTextIdx = useRef(-1);
+  const offCanvas = useRef<HTMLCanvasElement | null>(null);
 
   // State mirrors for canvas event handlers
   const toolR = useRef(tool);
@@ -96,16 +115,16 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
   const fontStR = useRef(fontSt);
   const selIdxR = useRef(selIdx);
 
-  // Function refs (populated by canvas useEffect, called by UI)
+  // Function refs
   const redrawFn = useRef(()=>{});
   const pushUndoFn = useRef(()=>{});
   const undoFn = useRef(()=>{});
   const redoFn = useRef(()=>{});
   const resetViewFn = useRef(()=>{});
   const loadImageFn = useRef((_f:File)=>{});
+  const loadImageDataURLFn = useRef((_src:string)=>{});
   const commitTextFn = useRef(()=>{});
   const setCursorFn = useRef((_c:string)=>{});
-  const editTextFn = useRef((_idx:number)=>{});
 
   // Sync state → refs
   useEffect(()=>{ toolR.current=tool; },[tool]);
@@ -151,7 +170,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
   }),[]);
 
   // ══════════════════════════════════════════════════════════════
-  // MAIN CANVAS ENGINE (useEffect — runs once)
+  // MAIN CANVAS ENGINE
   // ══════════════════════════════════════════════════════════════
   useEffect(()=>{
     const canvas = canvasRef.current;
@@ -159,14 +178,12 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
     if(!canvas||!wrap) return;
     const ctx = canvas.getContext('2d')!;
 
-    // ── Pointer position helper ──
     function ptr(e:PointerEvent){
       const r=canvas!.getBoundingClientRect();
       const sx=e.clientX-r.left, sy=e.clientY-r.top;
       return {sx,sy,...s2c(sx,sy)};
     }
 
-    // ── Resize ──
     function resize(){
       canvas!.width = wrap!.clientWidth;
       canvas!.height = wrap!.clientHeight;
@@ -201,7 +218,10 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
       }
     }
 
-    // ── Render element to context ──
+    // ── Render a single element ──
+    // NOTE: eraser uses destination-out, so it must be drawn AFTER the background
+    // on a canvas that already has the background painted. We render directly on
+    // the main canvas (not an offscreen), which is why drawBg() is called first.
     function renderEl(c:CanvasRenderingContext2D, el:DrawElement){
       c.save();
       c.globalAlpha=el.opacity??1;
@@ -224,14 +244,18 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
           c.lineTo(last.x,last.y); c.stroke(); break;
         }
         case 'eraser':{
+          // ── ERASER FIX: use destination-out to cut through drawn content ──
+          // This works because we draw the solid background first, then elements,
+          // so destination-out removes pixels back to the bg color (canvas default).
           const pts=el.points; if(!pts||pts.length<1) break;
-          // Eraser as visual guide during drawing, but real deletion happens on move
-          c.strokeStyle='rgba(0,0,0,0.1)';
-          c.fillStyle='rgba(0,0,0,0.05)';
+          c.globalCompositeOperation='destination-out';
+          c.globalAlpha=1;
+          c.strokeStyle='rgba(0,0,0,1)';
+          c.fillStyle='rgba(0,0,0,1)';
           c.lineWidth=(el.lineWidth??20)*vp.current.scale;
           if(pts.length===1){
             const p=c2s(pts[0].x,pts[0].y);
-            c.beginPath();c.arc(p.x,p.y,c.lineWidth/2,0,Math.PI*2);c.fill();
+            c.beginPath();c.arc(p.x,p.y,(el.lineWidth??20)*vp.current.scale/2,0,Math.PI*2);c.fill();
           } else {
             c.beginPath();
             const p0=c2s(pts[0].x,pts[0].y); c.moveTo(p0.x,p0.y);
@@ -243,7 +267,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
             const last=c2s(pts[pts.length-1].x,pts[pts.length-1].y);
             c.lineTo(last.x,last.y); c.stroke();
           }
-          break;
+          c.globalCompositeOperation='source-over'; break;
         }
         case 'line':{
           const a=c2s(el.x1!,el.y1!),b=c2s(el.x2!,el.y2!);
@@ -320,14 +344,27 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
     }
 
     // ── Full redraw ──
+    // FIX: elements (incl. eraser) are rendered on a separate OFFSCREEN layer.
+    // The eraser's destination-out only cuts through that layer, never through
+    // the background. The background is always painted fresh underneath and
+    // shows through cleanly wherever the eraser cut a hole — a real erase,
+    // not a colored patch on top.
     function doRedraw(){
-      const off=document.createElement('canvas');
-      off.width=canvas!.width; off.height=canvas!.height;
-      const oc=off.getContext('2d')!;
-      els.current.forEach(el=>renderEl(oc,el));
-      if(cur.current) renderEl(oc,cur.current);
+      let off = offCanvas.current;
+      if(!off){ off = document.createElement('canvas'); offCanvas.current = off; }
+      if(off.width!==canvas!.width || off.height!==canvas!.height){
+        off.width = canvas!.width; off.height = canvas!.height;
+      }
+      const octx = off.getContext('2d')!;
+      octx.clearRect(0,0,off.width,off.height);
+      // 1. Render all elements (and the in-progress one) onto the offscreen layer
+      els.current.forEach(el=>renderEl(octx,el));
+      if(cur.current) renderEl(octx,cur.current);
+      // 2. Paint the background fresh on the main canvas
       drawBg();
+      // 3. Composite the elements layer on top of the background
       ctx!.drawImage(off,0,0);
+      // 4. Draw selection overlay on top of everything
       if(selIdxR.current>=0&&selIdxR.current<els.current.length)
         renderSel(els.current[selIdxR.current]);
     }
@@ -409,8 +446,8 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
       const right=bb.x+bb.w, bottom=bb.y+bb.h;
       if(handle.includes('e')) el.w=x-el.x!;
       if(handle.includes('s')) el.h=y-el.y!;
-      if(handle.includes('w')){el.x!=x;el.w=right-x;}
-      if(handle.includes('n')){el.y!=y;el.h=bottom-y;}
+      if(handle.includes('w')){el.x=x;el.w=right-x;}
+      if(handle.includes('n')){el.y=y;el.h=bottom-y;}
     }
 
     // ── Serialize / Deserialize ──
@@ -466,330 +503,63 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
 
     // ── Cursor ──
     function getCursor(){
-      const map:{[k:string]:string}={pen:'crosshair',eraser:'cell',select:'default',text:'text',line:'crosshair',arrow:'crosshair',rect:'crosshair',circle:'crosshair',triangle:'crosshair'};
+      const map:{[k:string]:string}={pen:'crosshair',eraser:'cell',select:'default',text:'text',line:'crosshair',arrow:'crosshair',rect:'crosshair',circle:'crosshair',triangle:'crosshair',pan:'grab'};
       return map[toolR.current]||'default';
     }
     setCursorFn.current=(c:string)=>{canvas!.style.cursor=c;};
 
-    // ── Commit text ──
+    // ── Commit text (creates new text, OR saves edits to an existing one) ──
+    let textOverlayState = { cx:0, cy:0 };
     function commitText(){
       const ta=textAreaRef.current;
       if(!ta) return;
       const val=ta.value;
+      const idx=editTextIdx.current;
+
+      if(idx>=0&&idx<els.current.length){
+        // Editing an existing text element
+        pushUndo();
+        if(val.trim()){
+          els.current[idx].text=val;
+        } else {
+          els.current.splice(idx,1); // emptied out -> remove it
+        }
+        editTextIdx.current=-1;
+        selIdxR.current=-1; setSelIdx(-1);
+        doRedraw();
+        return;
+      }
+
       if(val.trim()){
         pushUndo();
-        if(editingTextIdxRef.current>=0){
-          els.current[editingTextIdxRef.current].text=val;
-          editingTextIdxRef.current=-1;
-        } else {
-          els.current.push({
-            type:'text',text:val,
-            x:textOverlayState.cx,y:textOverlayState.cy,
-            ...styleSnap(),
-          });
-        }
-        doRedraw();
-      } else if(editingTextIdxRef.current>=0){
-        // If empty text during edit, delete it
-        pushUndo();
-        els.current.splice(editingTextIdxRef.current,1);
-        editingTextIdxRef.current=-1;
+        els.current.push({
+          type:'text',text:val,
+          x:textOverlayState.cx,y:textOverlayState.cy,
+          ...styleSnap(),
+        });
         doRedraw();
       }
     }
     commitTextFn.current=commitText;
 
-    // ── Edit existing text ──
-    function editText(idx:number){
-      if(idx<0||idx>=els.current.length) return;
+    // ── Open the text overlay to EDIT an existing text element ──
+    function openTextEditor(idx:number){
       const el=els.current[idx];
-      if(el.type!=='text') return;
-      editingTextIdxRef.current=idx;
-      const sc=c2s(el.x!,el.y!);
+      if(!el||el.type!=='text') return;
+      editTextIdx.current=idx;
+      setTool('text'); toolR.current='text';
       const wr=wrap!.getBoundingClientRect();
-      textOverlayState={cx:el.x!,cy:el.y!,text:el.text||'',fontFamily:el.fontFamily||fontFamR.current,fontSize:el.fontSize||fontSzR.current,fontStyle:el.fontStyle||fontStR.current,stroke:el.stroke||strokeR.current};
-      setTextOverlay({left:sc.x+wr.left,top:sc.y+wr.top,cx:el.x!,cy:el.y!});
+      const pos=c2s(el.x!,el.y!);
+      textOverlayState={cx:el.x!,cy:el.y!};
+      setTextOverlay({left:pos.x+wr.left,top:pos.y+wr.top,cx:el.x!,cy:el.y!});
       setTimeout(()=>{
-        if(textAreaRef.current){
-          textAreaRef.current.value=el.text||'';
-          textAreaRef.current.focus();
-          textAreaRef.current.select();
+        const ta=textAreaRef.current;
+        if(ta){
+          ta.value=el.text??'';
+          ta.focus();
+          ta.select();
         }
       },10);
-    }
-    editTextFn.current=editText;
-
-  // We need to store text overlay position for the commit function
-  let textOverlayState = { cx:0, cy:0, text:'', fontFamily:'', fontSize:20, fontStyle:'normal', stroke:'#000' };
-
-    // ═══ POINTER EVENTS ═══
-    function onPointerDown(e:PointerEvent){
-      canvas!.setPointerCapture(e.pointerId);
-      const {sx,sy,x,y}=ptr(e);
-
-      // Panning with right-click, middle-click, or space+left-click
-      if(e.button===2 || e.button===1 || (e.button===0 && spaceDown.current)){
-        isPanning.current=true;
-        panOrigin.current={x:sx-vp.current.x,y:sy-vp.current.y};
-        canvas!.style.cursor='grabbing'; return;
-      }
-      if(e.button!==0) return;
-
-      // Commit open text (via ref to avoid stale closure)
-      if(toolR.current!=='text'){
-        commitTextFn.current();
-        editingTextIdxRef.current=-1;
-        setTextOverlay(null);
-      }
-
-      // Select tool
-      if(toolR.current==='select'){
-        if(selIdxR.current>=0){
-          const h=hitHandle(els.current[selIdxR.current],sx,sy);
-          if(h){dragMode.current='resize';rHandle.current=h;rBBox.current={...getBBox(els.current[selIdxR.current])};return;}
-        }
-        let found=-1;
-        for(let i=els.current.length-1;i>=0;i--){
-          if(hitTest(els.current[i],x,y)){found=i;break;}
-        }
-        if(found>=0){
-          // Check for double-click on text element
-          const now=Date.now();
-          if(els.current[found].type==='text'&&found===lastClickIdxRef.current&&now-lastClickTimeRef.current<300){
-            editTextFn.current(found);
-            lastClickTimeRef.current=0;
-            lastClickIdxRef.current=-1;
-            return;
-          }
-          lastClickTimeRef.current=now;
-          lastClickIdxRef.current=found;
-          
-          selIdxR.current=found; setSelIdx(found);
-          const bb=getBBox(els.current[found]);
-          dragOff.current={x:x-(bb?.x??x),y:y-(bb?.y??y)};
-          dragMode.current='move'; isDrawing.current=true;
-        } else {
-          selIdxR.current=-1; setSelIdx(-1);
-          lastClickTimeRef.current=0;
-          lastClickIdxRef.current=-1;
-        }
-        doRedraw(); return;
-      }
-
-      // Text tool
-      if(toolR.current==='text'){
-        const sc=c2s(x,y);
-        const wr=wrap!.getBoundingClientRect();
-        textOverlayState={cx:x,cy:y};
-        setTextOverlay({left:sc.x+wr.left,top:sc.y+wr.top,cx:x,cy:y});
-        setTimeout(()=>textAreaRef.current?.focus(),10);
-        return;
-      }
-
-      // Drawing tools
-      isDrawing.current=true;
-      rawPts.current=[{x,y}];
-
-      if(toolR.current==='pen'||toolR.current==='eraser'){
-        cur.current={
-          type:toolR.current,points:[{x,y}],
-          stroke:strokeR.current,fill:'transparent',useFill:false,
-          lineWidth:toolR.current==='eraser'?lineWR.current*4:lineWR.current,
-          opacity:1,
-        };
-      } else {
-        cur.current={type:toolR.current,x,y,w:0,h:0,x1:x,y1:y,x2:x,y2:y,...styleSnap()};
-      }
-    }
-
-    function onPointerMove(e:PointerEvent){
-      const {sx,sy,x,y}=ptr(e);
-
-      // Handle hover for select tool
-      if(toolR.current==='select'&&selIdxR.current>=0&&!isDrawing.current){
-        const h=hitHandle(els.current[selIdxR.current],sx,sy);
-        if(h){
-          const cursors:{[k:string]:string}={nw:'nw-resize',ne:'ne-resize',sw:'sw-resize',se:'se-resize'};
-          canvas!.style.cursor=cursors[h]||'default';
-        } else {
-          canvas!.style.cursor=getCursor();
-        }
-      }
-
-      if(isPanning.current){
-        vp.current.x=sx-panOrigin.current.x;
-        vp.current.y=sy-panOrigin.current.y;
-        doRedraw(); return;
-      }
-
-      if(toolR.current==='select'){
-        if(dragMode.current==='move'&&isDrawing.current&&selIdxR.current>=0){
-          const bb=getBBox(els.current[selIdxR.current]);
-          const tx=x-dragOff.current.x, ty=y-dragOff.current.y;
-          const dx=tx-(bb?.x??0), dy=ty-(bb?.y??0);
-          moveEl(els.current[selIdxR.current],dx,dy);
-          doRedraw(); return;
-        }
-        if(dragMode.current==='resize'&&selIdxR.current>=0){
-          applyResize(els.current[selIdxR.current],rHandle.current,x,y);
-          doRedraw(); return;
-        }
-        return;
-      }
-
-      if(!isDrawing.current||!cur.current) return;
-
-      if(cur.current.type==='pen'){
-        rawPts.current.push({x,y});
-        cur.current.points=smoothPts(rawPts.current,smoothR.current);
-        doRedraw(); return;
-      }
-
-      if(cur.current.type==='eraser'){
-        rawPts.current.push({x,y});
-        cur.current.points=rawPts.current;
-        // Real-time deletion: remove ALL elements that hit the eraser path
-        let changed = false;
-        for (let i = els.current.length - 1; i >= 0; i--) {
-          if (hitTest(els.current[i], x, y)) {
-            if (!changed) { pushUndo(); changed = true; }
-            els.current.splice(i, 1);
-            if (selIdxR.current === i) { selIdxR.current = -1; setSelIdx(-1); }
-            else if (selIdxR.current > i) { selIdxR.current--; setSelIdx(prev => prev - 1); }
-          }
-        }
-        doRedraw(); return;
-      }
-
-      cur.current.x2=x; cur.current.y2=y;
-      cur.current.w=x-cur.current.x!; cur.current.h=y-cur.current.y!;
-
-      if(e.shiftKey&&['rect','circle','triangle'].includes(cur.current.type)){
-        const side=Math.sign(cur.current.w)*Math.max(Math.abs(cur.current.w),Math.abs(cur.current.h));
-        cur.current.w=side; cur.current.h=side;
-      }
-      if(e.shiftKey&&['line','arrow'].includes(cur.current.type)){
-        const dx2=x-cur.current.x1!,dy2=y-cur.current.y1!;
-        const angle=Math.round(Math.atan2(dy2,dx2)/(Math.PI/4))*(Math.PI/4);
-        const dist=Math.sqrt(dx2*dx2+dy2*dy2);
-        cur.current.x2=cur.current.x1!+Math.cos(angle)*dist;
-        cur.current.y2=cur.current.y1!+Math.sin(angle)*dist;
-      }
-      doRedraw();
-    }
-
-    function onPointerUp(_e:PointerEvent){
-      if(isPanning.current){
-        isPanning.current=false;
-        canvas!.style.cursor=spaceDown.current?'grab':getCursor();
-        return;
-      }
-      if(dragMode.current==='move'||dragMode.current==='resize'){
-        if(isDrawing.current){pushUndo();isDrawing.current=false;}
-        dragMode.current=''; return;
-      }
-      if(!isDrawing.current) return;
-      isDrawing.current=false;
-      if(toolR.current==='select') return;
-      if(!cur.current) return;
-      if(cur.current.type==='eraser'){cur.current=null;doRedraw();return;}
-
-      // Validate minimum size
-      if(['pen'].includes(cur.current.type)){
-        if(!cur.current.points||cur.current.points.length<2){cur.current=null;return;}
-        cur.current.points=smoothPts(rawPts.current,smoothR.current);
-      }
-      if(['rect','circle','triangle'].includes(cur.current.type)){
-        if(Math.abs(cur.current.w!)<4&&Math.abs(cur.current.h!)<4){cur.current=null;return;}
-      }
-      if(['line','arrow'].includes(cur.current.type)){
-        const dx2=cur.current.x2!-cur.current.x1!,dy2=cur.current.y2!-cur.current.y1!;
-        if(Math.sqrt(dx2*dx2+dy2*dy2)<4){cur.current=null;return;}
-      }
-
-      pushUndo();
-      els.current.push(cur.current);
-      cur.current=null;
-      doRedraw();
-    }
-
-    // ═══ WHEEL ZOOM ═══
-    function onWheel(e:WheelEvent){
-      e.preventDefault();
-      const r=canvas!.getBoundingClientRect();
-      const sx=e.clientX-r.left, sy=e.clientY-r.top;
-      const dir=e.deltaY<0?1:-1;
-      const step=e.ctrlKey?0.04:0.12;
-      const factor=1+dir*step;
-      const ns=Math.max(0.04,Math.min(30,vp.current.scale*factor));
-      vp.current.x=sx-(sx-vp.current.x)*(ns/vp.current.scale);
-      vp.current.y=sy-(sy-vp.current.y)*(ns/vp.current.scale);
-      vp.current.scale=ns;
-      doRedraw();
-    }
-
-    // ═══ CONTEXT MENU (prevent right-click menu during panning) ═══
-    function onContextMenu(e:MouseEvent){
-      e.preventDefault();
-      // Detect double right-click for text editing
-      const now = Date.now();
-      const r = canvas!.getBoundingClientRect();
-      const sx = e.clientX - r.left, sy = e.clientY - r.top;
-      const { x, y } = s2c(sx, sy);
-      
-      let found = -1;
-      for (let i = els.current.length - 1; i >= 0; i--) {
-        if (hitTest(els.current[i], x, y)) { found = i; break; }
-      }
-
-      if (found >= 0 && els.current[found].type === 'text') {
-        if (found === lastClickIdxRef.current && now - lastClickTimeRef.current < 500) {
-          editTextFn.current(found);
-          lastClickTimeRef.current = 0;
-          lastClickIdxRef.current = -1;
-        } else {
-          lastClickTimeRef.current = now;
-          lastClickIdxRef.current = found;
-        }
-      }
-    }
-
-    // ═══ KEYBOARD ═══
-    function onKeyDown(e:KeyboardEvent){
-      const tag=(document.activeElement?.tagName)??'';
-      if(tag==='TEXTAREA'||tag==='INPUT'||tag==='SELECT') return;
-
-      if(e.code==='Space'&&!e.ctrlKey){
-        if(!spaceDown.current){spaceDown.current=true;canvas!.style.cursor='grab';}
-        e.preventDefault(); return;
-      }
-
-      if(e.ctrlKey||e.metaKey){
-        switch(e.key.toLowerCase()){
-          case 'z':e.preventDefault();doUndo();return;
-          case 'y':e.preventDefault();doRedo();return;
-          case 's':e.preventDefault();saveBoard();return;
-        }
-        return;
-      }
-
-      const toolKeys:{[k:string]:string}={p:'pen',e:'eraser',v:'select',t:'text',r:'rect',c:'circle',l:'line',a:'arrow',g:'triangle'};
-      if(toolKeys[e.key.toLowerCase()]){setTool(toolKeys[e.key.toLowerCase()]);return;}
-
-      switch(e.key.toLowerCase()){
-        case 'i':fileInputRef.current?.click();return;
-        case 'd':cycleBg();return;
-        case '0':resetView();return;
-      }
-      if(e.key==='Delete'||e.key==='Backspace'){if(selIdxR.current>=0)deleteSelected();return;}
-      if(e.key==='Escape'){setSelIdx(-1);selIdxR.current=-1;doRedraw();return;}
-    }
-
-    function onKeyUp(e:KeyboardEvent){
-      if(e.code==='Space'){
-        spaceDown.current=false;
-        canvas!.style.cursor=isPanning.current?'grabbing':getCursor();
-      }
     }
 
     // ── Reset view ──
@@ -851,29 +621,295 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
       showToastR.current('✕ Eliminado');
     }
 
-    // ── Load image file ──
+    // ── Load image from File ──
     function loadImageFile(file:File){
       const reader=new FileReader();
       reader.onload=ev=>{
-        const imgEl=new Image();
-        imgEl.onload=()=>{
-          const center=s2c(canvas!.width/2,canvas!.height/2);
-          const MAX=500;
-          let w=imgEl.width,h=imgEl.height;
-          if(w>MAX){h=h*MAX/w;w=MAX;} if(h>MAX){w=w*MAX/h;h=MAX;}
-          pushUndo();
-          els.current.push({type:'image',imgEl,x:center.x-w/2,y:center.y-h/2,w,h,
-            stroke:'#000',fill:'transparent',useFill:false,lineWidth:1,opacity:1});
-          setTool('select'); toolR.current='select';
-          selIdxR.current=els.current.length-1; setSelIdx(els.current.length-1);
-          doRedraw();
-          showToastR.current('Imagen añadida 🖼️');
-        };
-        imgEl.src=ev.target?.result as string;
+        loadImageFromDataURL(ev.target?.result as string);
       };
       reader.readAsDataURL(file);
     }
     loadImageFn.current=loadImageFile;
+
+    // ── Load image from data URL (used for file AND clipboard paste) ──
+    function loadImageFromDataURL(src:string){
+      const imgEl=new Image();
+      imgEl.onload=()=>{
+        const center=s2c(canvas!.width/2,canvas!.height/2);
+        const MAX=500;
+        let w=imgEl.width,h=imgEl.height;
+        if(w>MAX){h=h*MAX/w;w=MAX;} if(h>MAX){w=w*MAX/h;h=MAX;}
+        pushUndo();
+        els.current.push({type:'image',imgEl,x:center.x-w/2,y:center.y-h/2,w,h,
+          stroke:'#000',fill:'transparent',useFill:false,lineWidth:1,opacity:1});
+        setTool('select'); toolR.current='select';
+        selIdxR.current=els.current.length-1; setSelIdx(els.current.length-1);
+        doRedraw();
+        showToastR.current('Imagen añadida 🖼️');
+      };
+      imgEl.src=src;
+    }
+    loadImageDataURLFn.current=loadImageFromDataURL;
+
+    // ═══ POINTER EVENTS ═══
+    function onPointerDown(e:PointerEvent){
+      canvas!.setPointerCapture(e.pointerId);
+      const {sx,sy,x,y}=ptr(e);
+
+      // Pan: middle-click, Space+drag, OR the dedicated "hand" tool with a
+      // plain left click — this is what makes the infinite board actually
+      // draggable without holding any key.
+      if(e.button===1||(e.button===0&&spaceDown.current)||(e.button===0&&toolR.current==='pan')){
+        isPanning.current=true;
+        panOrigin.current={x:sx-vp.current.x,y:sy-vp.current.y};
+        canvas!.style.cursor='grabbing'; return;
+      }
+      if(e.button!==0) return;
+
+      if(toolR.current!=='text'){
+        commitTextFn.current();
+        setTextOverlay(null);
+      }
+
+      if(toolR.current==='select'){
+        if(selIdxR.current>=0){
+          const h=hitHandle(els.current[selIdxR.current],sx,sy);
+          if(h){dragMode.current='resize';rHandle.current=h;rBBox.current={...getBBox(els.current[selIdxR.current])};return;}
+        }
+        let found=-1;
+        for(let i=els.current.length-1;i>=0;i--){
+          if(hitTest(els.current[i],x,y)){found=i;break;}
+        }
+        if(found>=0){
+          selIdxR.current=found; setSelIdx(found);
+          const bb=getBBox(els.current[found]);
+          dragOff.current={x:x-(bb?.x??x),y:y-(bb?.y??y)};
+          dragMode.current='move'; isDrawing.current=true;
+        } else {
+          selIdxR.current=-1; setSelIdx(-1);
+        }
+        doRedraw(); return;
+      }
+
+      if(toolR.current==='text'){
+        // Clicking on top of an existing text element edits it instead of
+        // creating a new overlapping one.
+        for(let i=els.current.length-1;i>=0;i--){
+          if(els.current[i].type==='text'&&hitTest(els.current[i],x,y)){
+            openTextEditor(i);
+            return;
+          }
+        }
+        editTextIdx.current=-1;
+        const sc=c2s(x,y);
+        const wr=wrap!.getBoundingClientRect();
+        textOverlayState={cx:x,cy:y};
+        setTextOverlay({left:sc.x+wr.left,top:sc.y+wr.top,cx:x,cy:y});
+        setTimeout(()=>textAreaRef.current?.focus(),10);
+        return;
+      }
+
+      isDrawing.current=true;
+      rawPts.current=[{x,y}];
+
+      if(toolR.current==='pen'||toolR.current==='eraser'){
+        cur.current={
+          type:toolR.current,points:[{x,y}],
+          stroke:strokeR.current,fill:'transparent',useFill:false,
+          lineWidth:toolR.current==='eraser'?lineWR.current*4:lineWR.current,
+          opacity:1,
+        };
+      } else {
+        cur.current={type:toolR.current,x,y,w:0,h:0,x1:x,y1:y,x2:x,y2:y,...styleSnap()};
+      }
+    }
+
+    function onPointerMove(e:PointerEvent){
+      const {sx,sy,x,y}=ptr(e);
+
+      if(toolR.current==='select'&&selIdxR.current>=0&&!isDrawing.current){
+        const h=hitHandle(els.current[selIdxR.current],sx,sy);
+        if(h){
+          const cursors:{[k:string]:string}={nw:'nw-resize',ne:'ne-resize',sw:'sw-resize',se:'se-resize'};
+          canvas!.style.cursor=cursors[h]||'default';
+        } else {
+          canvas!.style.cursor=getCursor();
+        }
+      }
+
+      if(isPanning.current){
+        vp.current.x=sx-panOrigin.current.x;
+        vp.current.y=sy-panOrigin.current.y;
+        doRedraw(); return;
+      }
+
+      if(toolR.current==='select'){
+        if(dragMode.current==='move'&&isDrawing.current&&selIdxR.current>=0){
+          const bb=getBBox(els.current[selIdxR.current]);
+          const tx=x-dragOff.current.x, ty=y-dragOff.current.y;
+          const dx=tx-(bb?.x??0), dy=ty-(bb?.y??0);
+          moveEl(els.current[selIdxR.current],dx,dy);
+          doRedraw(); return;
+        }
+        if(dragMode.current==='resize'&&selIdxR.current>=0){
+          applyResize(els.current[selIdxR.current],rHandle.current,x,y);
+          doRedraw(); return;
+        }
+        return;
+      }
+
+      if(!isDrawing.current||!cur.current) return;
+
+      if(cur.current.type==='pen'||cur.current.type==='eraser'){
+        rawPts.current.push({x,y});
+        cur.current.points=smoothPts(rawPts.current,smoothR.current);
+        doRedraw(); return;
+      }
+
+      cur.current.x2=x; cur.current.y2=y;
+      cur.current.w=x-cur.current.x!; cur.current.h=y-cur.current.y!;
+
+      if(e.shiftKey&&['rect','circle','triangle'].includes(cur.current.type)){
+        const side=Math.sign(cur.current.w)*Math.max(Math.abs(cur.current.w),Math.abs(cur.current.h));
+        cur.current.w=side; cur.current.h=side;
+      }
+      if(e.shiftKey&&['line','arrow'].includes(cur.current.type)){
+        const dx2=x-cur.current.x1!,dy2=y-cur.current.y1!;
+        const angle=Math.round(Math.atan2(dy2,dx2)/(Math.PI/4))*(Math.PI/4);
+        const dist=Math.sqrt(dx2*dx2+dy2*dy2);
+        cur.current.x2=cur.current.x1!+Math.cos(angle)*dist;
+        cur.current.y2=cur.current.y1!+Math.sin(angle)*dist;
+      }
+      doRedraw();
+    }
+
+    function onPointerUp(_e:PointerEvent){
+      if(isPanning.current){
+        isPanning.current=false;
+        canvas!.style.cursor=spaceDown.current?'grab':getCursor();
+        return;
+      }
+      if(dragMode.current==='move'||dragMode.current==='resize'){
+        if(isDrawing.current){pushUndo();isDrawing.current=false;}
+        dragMode.current=''; return;
+      }
+      if(!isDrawing.current) return;
+      isDrawing.current=false;
+      if(toolR.current==='select') return;
+      if(!cur.current) return;
+
+      if(['pen','eraser'].includes(cur.current.type)){
+        if(!cur.current.points||cur.current.points.length<2){cur.current=null;doRedraw();return;}
+        cur.current.points=smoothPts(rawPts.current,smoothR.current);
+      }
+      if(['rect','circle','triangle'].includes(cur.current.type)){
+        if(Math.abs(cur.current.w!)<4&&Math.abs(cur.current.h!)<4){cur.current=null;return;}
+      }
+      if(['line','arrow'].includes(cur.current.type)){
+        const dx2=cur.current.x2!-cur.current.x1!,dy2=cur.current.y2!-cur.current.y1!;
+        if(Math.sqrt(dx2*dx2+dy2*dy2)<4){cur.current=null;return;}
+      }
+
+      pushUndo();
+      els.current.push(cur.current);
+      cur.current=null;
+      doRedraw();
+    }
+
+    // ═══ DOUBLE-CLICK: edit an existing text element ═══
+    // FIX: this is what lets you re-open a text box and correct it — works
+    // whether you're on the "select" tool or the "text" tool.
+    function onDblClick(e:MouseEvent){
+      if(toolR.current!=='select'&&toolR.current!=='text') return;
+      const r=canvas!.getBoundingClientRect();
+      const sx=e.clientX-r.left, sy=e.clientY-r.top;
+      const {x,y}=s2c(sx,sy);
+      for(let i=els.current.length-1;i>=0;i--){
+        if(els.current[i].type==='text'&&hitTest(els.current[i],x,y)){
+          selIdxR.current=i; setSelIdx(i);
+          openTextEditor(i);
+          return;
+        }
+      }
+    }
+
+    // ═══ WHEEL ZOOM ═══
+    function onWheel(e:WheelEvent){
+      e.preventDefault();
+      const r=canvas!.getBoundingClientRect();
+      const sx=e.clientX-r.left, sy=e.clientY-r.top;
+      const dir=e.deltaY<0?1:-1;
+      const step=e.ctrlKey?0.04:0.12;
+      const factor=1+dir*step;
+      const ns=Math.max(0.04,Math.min(30,vp.current.scale*factor));
+      vp.current.x=sx-(sx-vp.current.x)*(ns/vp.current.scale);
+      vp.current.y=sy-(sy-vp.current.y)*(ns/vp.current.scale);
+      vp.current.scale=ns;
+      doRedraw();
+    }
+
+    // ═══ KEYBOARD ═══
+    function onKeyDown(e:KeyboardEvent){
+      const tag=(document.activeElement?.tagName)??'';
+      if(tag==='TEXTAREA'||tag==='INPUT'||tag==='SELECT') return;
+
+      if(e.code==='Space'&&!e.ctrlKey){
+        if(!spaceDown.current){spaceDown.current=true;canvas!.style.cursor='grab';}
+        e.preventDefault(); return;
+      }
+
+      if(e.ctrlKey||e.metaKey){
+        switch(e.key.toLowerCase()){
+          case 'z':e.preventDefault();doUndo();return;
+          case 'y':e.preventDefault();doRedo();return;
+          case 's':e.preventDefault();saveBoard();return;
+        }
+        return;
+      }
+
+      const toolKeys:{[k:string]:string}={p:'pen',e:'eraser',v:'select',t:'text',r:'rect',c:'circle',l:'line',a:'arrow',g:'triangle',h:'pan'};
+      if(toolKeys[e.key.toLowerCase()]){setTool(toolKeys[e.key.toLowerCase()]);return;}
+
+      switch(e.key.toLowerCase()){
+        case 'i':fileInputRef.current?.click();return;
+        case 'd':cycleBg();return;
+        case '0':resetView();return;
+      }
+      if(e.key==='Delete'||e.key==='Backspace'){if(selIdxR.current>=0)deleteSelected();return;}
+      if(e.key==='Escape'){setSelIdx(-1);selIdxR.current=-1;doRedraw();return;}
+    }
+
+    function onKeyUp(e:KeyboardEvent){
+      if(e.code==='Space'){
+        spaceDown.current=false;
+        canvas!.style.cursor=isPanning.current?'grabbing':getCursor();
+      }
+    }
+
+    // ═══ PASTE FROM CLIPBOARD ═══
+    function onPaste(e:ClipboardEvent){
+      const tag=(document.activeElement?.tagName)??'';
+      if(tag==='TEXTAREA'||tag==='INPUT') return;
+      const items=e.clipboardData?.items;
+      if(!items) return;
+      for(let i=0;i<items.length;i++){
+        if(items[i].type.startsWith('image/')){
+          e.preventDefault();
+          const file=items[i].getAsFile();
+          if(file) loadImageFile(file);
+          return;
+        }
+      }
+    }
+
+    // ═══ DRAG & DROP ═══
+    function onDragOver(e:DragEvent){e.preventDefault();wrap!.style.outline='3px dashed var(--accent)';}
+    function onDragLeave(){wrap!.style.outline='';}
+    function onDrop(e:DragEvent){
+      e.preventDefault();wrap!.style.outline='';
+      const file=[...e.dataTransfer!.files].find(f=>f.type.startsWith('image/'));
+      if(file) loadImageFile(file);
+    }
 
     // ═══ ATTACH EVENTS ═══
     resize();
@@ -882,19 +918,11 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
     canvas.addEventListener('pointermove',onPointerMove);
     canvas.addEventListener('pointerup',onPointerUp);
     canvas.addEventListener('pointercancel',onPointerUp);
+    canvas.addEventListener('dblclick',onDblClick);
     canvas.addEventListener('wheel',onWheel,{passive:false});
-    canvas.addEventListener('contextmenu',onContextMenu);
     document.addEventListener('keydown',onKeyDown);
     document.addEventListener('keyup',onKeyUp);
-
-    // Drag & drop
-    function onDragOver(e:DragEvent){e.preventDefault();wrap!.style.outline='3px dashed var(--accent)';}
-    function onDragLeave(){wrap!.style.outline='';}
-    function onDrop(e:DragEvent){
-      e.preventDefault();wrap!.style.outline='';
-      const file=[...e.dataTransfer!.files].find(f=>f.type.startsWith('image/'));
-      if(file) loadImageFile(file);
-    }
+    document.addEventListener('paste',onPaste);
     wrap.addEventListener('dragover',onDragOver);
     wrap.addEventListener('dragleave',onDragLeave);
     wrap.addEventListener('drop',onDrop);
@@ -909,7 +937,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
       const cx=canvas.width/2,cy=canvas.height/2;
       const c=s2c(cx,cy);
       els.current.push({
-        type:'text',text:'¡Bienvenido a Drawdams! ✏️\nElige una herramienta y empieza a crear.\nD = cambiar fondo · Ctrl+Z = deshacer · Rueda = zoom',
+        type:'text',text:'¡Bienvenido a Drawdams! ✏️\nElige una herramienta y empieza a crear.\nD = cambiar fondo · Ctrl+Z = deshacer · Rueda = zoom · Ctrl+V = pegar imagen',
         x:c.x-280,y:c.y-50,
         stroke:'#6b7280',fill:'transparent',useFill:false,lineWidth:1,opacity:0.7,
         fontFamily:"'Inter',sans-serif",fontSize:15,fontStyle:'normal',
@@ -923,10 +951,11 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
       canvas.removeEventListener('pointermove',onPointerMove);
       canvas.removeEventListener('pointerup',onPointerUp);
       canvas.removeEventListener('pointercancel',onPointerUp);
+      canvas.removeEventListener('dblclick',onDblClick);
       canvas.removeEventListener('wheel',onWheel);
-      canvas.removeEventListener('contextmenu',onContextMenu);
       document.removeEventListener('keydown',onKeyDown);
       document.removeEventListener('keyup',onKeyUp);
+      document.removeEventListener('paste',onPaste);
       wrap.removeEventListener('dragover',onDragOver);
       wrap.removeEventListener('dragleave',onDragLeave);
       wrap.removeEventListener('drop',onDrop);
@@ -940,7 +969,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
   const handleToolChange = useCallback((t:string)=>{
     setTool(t); toolR.current=t;
     if(t!=='text'&&textOverlay){commitTextFn.current();setTextOverlay(null);}
-    const cursors:{[k:string]:string}={pen:'crosshair',eraser:'cell',select:'default',text:'text',line:'crosshair',arrow:'crosshair',rect:'crosshair',circle:'crosshair',triangle:'crosshair'};
+    const cursors:{[k:string]:string}={pen:'crosshair',eraser:'cell',select:'default',text:'text',line:'crosshair',arrow:'crosshair',rect:'crosshair',circle:'crosshair',triangle:'crosshair',pan:'grab'};
     setCursorFn.current(cursors[t]||'default');
   },[textOverlay]);
 
@@ -957,7 +986,6 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
     const preset=BG_PRESETS[bgIdx.current];
     ec.fillStyle=preset.canvasBg;
     ec.fillRect(0,0,exp.width,exp.height);
-    // Reuse the renderEl from engine — we'll just draw from the main canvas
     ec.drawImage(canvas,0,0);
     exp.toBlob(blob=>{
       if(!blob) return;
@@ -985,7 +1013,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
       switch(el.type){
         case 'pen':{
           if(!el.points?.length) break;
-          let d=el.points.map((p,i)=>{const s=c2sFn(p.x,p.y);return i===0?`M${s.x.toFixed(1)},${s.y.toFixed(1)}`:`L${s.x.toFixed(1)},${s.y.toFixed(1)}`;}).join(' ');
+          const d=el.points.map((p,i)=>{const s=c2sFn(p.x,p.y);return i===0?`M${s.x.toFixed(1)},${s.y.toFixed(1)}`:`L${s.x.toFixed(1)},${s.y.toFixed(1)}`;}).join(' ');
           svg+=`<path d="${d}" stroke="${st}" stroke-width="${sw}" fill="none" opacity="${al}" stroke-linecap="round" stroke-linejoin="round"/>`; break;
         }
         case 'line':case 'arrow':{
@@ -1026,8 +1054,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
   },[showToast]);
 
   const handleSaveToDrive = useCallback(()=>{
-    showToast('☁️ Subiendo a Google Drive...');
-    setTimeout(()=>showToast('✓ Guardado en carpeta "Drawdams" de Google Drive'),2000);
+    showToast('☁️ Sube a Drive: exporta PNG y guárdalo manualmente');
   },[showToast]);
 
   const handleClear = useCallback(()=>{
@@ -1073,17 +1100,45 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
   },[]);
 
   const handleTextKeyDown = useCallback((e:React.KeyboardEvent<HTMLTextAreaElement>)=>{
-    if(e.key==='Escape'){
-      editingTextIdxRef.current=-1;
-      setTextOverlay(null);
-      e.stopPropagation();
-    }
+    if(e.key==='Escape'){setTextOverlay(null);editTextIdx.current=-1;e.stopPropagation();}
     if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){
       e.preventDefault();
       commitTextFn.current();
       setTextOverlay(null);
     }
   },[]);
+
+  // Insert math symbol into active text area or as new text element
+  const handleInsertSymbol = useCallback((sym:string)=>{
+    const ta=textAreaRef.current;
+    if(ta&&textOverlay){
+      const start=ta.selectionStart??ta.value.length;
+      const end=ta.selectionEnd??ta.value.length;
+      const newVal=ta.value.slice(0,start)+sym+ta.value.slice(end);
+      ta.value=newVal;
+      const pos=start+sym.length;
+      ta.setSelectionRange(pos,pos);
+      ta.focus();
+    } else {
+      // Place as new text in the center of the canvas
+      const canvas=canvasRef.current;
+      if(!canvas) return;
+      const center=((vp:any)=>({
+        x:(canvas.width/2-vp.x)/vp.scale,
+        y:(canvas.height/2-vp.y)/vp.scale,
+      }))(vp.current);
+      pushUndoFn.current();
+      els.current.push({
+        type:'text',text:sym,
+        x:center.x,y:center.y,
+        stroke:strokeColor,fill:'transparent',useFill:false,
+        lineWidth:1,opacity:opacityVal/100,
+        fontFamily:fontFam,fontSize:fontSz*2,fontStyle:fontSt,
+      });
+      redrawFn.current();
+      showToast(`Símbolo ${sym} añadido`);
+    }
+  },[textOverlay,strokeColor,opacityVal,fontFam,fontSz,fontSt,showToast]);
 
   // Selection bar actions
   const handleSelDup = useCallback(()=>{
@@ -1139,7 +1194,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
   // ══════════════════════════════════════════════════════════════
   // RENDER
   // ══════════════════════════════════════════════════════════════
-  const toolIcons:{[k:string]:string}={pen:'✏️',eraser:'🧹',select:'🖱️',text:'T',line:'╱',arrow:'→',rect:'▭',circle:'○',triangle:'△'};
+  const toolIcons:{[k:string]:string}={pen:'✏️',eraser:'🧹',select:'🖱️',text:'T',pan:'✋',line:'╱',arrow:'→',rect:'▭',circle:'○',triangle:'△'};
   const toolLabel=(t:string)=>(toolIcons[t]||'')+' '+t.charAt(0).toUpperCase()+t.slice(1);
 
   return (
@@ -1160,6 +1215,10 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
         <button className={`tb-btn ${tool==='select'?'active':''}`} onClick={()=>handleToolChange('select')} aria-label="Seleccionar">
           <svg viewBox="0 0 24 24"><path d="M5 3l14 9-7 1-3 7z"/></svg>
           <span className="tip">Seleccionar <kbd>V</kbd></span>
+        </button>
+        <button className={`tb-btn ${tool==='pan'?'active':''}`} onClick={()=>handleToolChange('pan')} aria-label="Mano (mover lienzo)">
+          <svg viewBox="0 0 24 24"><path d="M18 11V6a2 2 0 00-2-2 2 2 0 00-2 2"/><path d="M14 10V4a2 2 0 00-2-2 2 2 0 00-2 2v2"/><path d="M10 10.5V6a2 2 0 00-2-2 2 2 0 00-2 2v8"/><path d="M18 8a2 2 0 114 0v6a8 8 0 01-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-4.19a2 2 0 012.83-2.82L7 15"/></svg>
+          <span className="tip">Mano <kbd>H</kbd></span>
         </button>
         <button className={`tb-btn text-icon ${tool==='text'?'active':''}`} onClick={()=>handleToolChange('text')} aria-label="Texto">
           T
@@ -1193,7 +1252,14 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
 
         <button className="tb-btn" onClick={()=>fileInputRef.current?.click()} aria-label="Subir imagen">
           <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
-          <span className="tip">Imagen <kbd>I</kbd></span>
+          <span className="tip">Imagen <kbd>I</kbd> / Ctrl+V</span>
+        </button>
+
+        {/* Math symbols button */}
+        <button className={`tb-btn ${showMathPanel?'active':''}`}
+          onClick={()=>setShowMathPanel(p=>!p)} aria-label="Símbolos matemáticos">
+          <span style={{fontSize:15,fontWeight:700,fontFamily:'serif'}}>∑</span>
+          <span className="tip">Símbolos matemáticos</span>
         </button>
 
         <div className="tb-spacer"/>
@@ -1240,6 +1306,35 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
         <button className="logout-btn" onClick={onLogout}>Salir</button>
       </div>
 
+      {/* ═══ MATH SYMBOLS PANEL ═══ */}
+      {showMathPanel&&(
+        <div className="math-panel">
+          <div className="math-panel-header">
+            <span style={{fontWeight:600,fontSize:13}}>Símbolos matemáticos</span>
+            <button className="modal-close-btn" style={{width:24,height:24,fontSize:13}}
+              onClick={()=>setShowMathPanel(false)}>✕</button>
+          </div>
+          <div className="math-cats">
+            {MATH_SYMBOLS.map((cat,i)=>(
+              <button key={i} className={`math-cat-btn ${mathCat===i?'active':''}`}
+                onClick={()=>setMathCat(i)}>{cat.label}</button>
+            ))}
+          </div>
+          <div className="math-grid">
+            {MATH_SYMBOLS[mathCat].symbols.map((sym,i)=>(
+              <button key={i} className="math-sym-btn"
+                title={`Insertar ${sym}`}
+                onClick={()=>handleInsertSymbol(sym)}>
+                {sym}
+              </button>
+            ))}
+          </div>
+          <div style={{padding:'6px 10px',fontSize:10,color:'var(--text2)',borderTop:'1px solid var(--border)'}}>
+            {textOverlay ? 'Se insertará en el texto activo' : 'Se colocará en el centro del lienzo'}
+          </div>
+        </div>
+      )}
+
       {/* ═══ RIGHT PANEL ═══ */}
       <div className="panel" role="complementary" aria-label="Propiedades">
 
@@ -1259,7 +1354,6 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
             </div>
           </div>
 
-          {/* Quick palette for text color */}
           {(tool==='text')&&(
             <div style={{marginTop:8}}>
               <div style={{fontSize:10,color:'var(--text2)',marginBottom:4}}>Color de texto</div>
@@ -1273,7 +1367,6 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
             </div>
           )}
 
-          {/* Quick palette for shape stroke */}
           {['rect','circle','triangle','line','arrow'].includes(tool)&&(
             <div style={{marginTop:8}}>
               <div style={{fontSize:10,color:'var(--text2)',marginBottom:4}}>Color de contorno</div>
@@ -1287,7 +1380,6 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
             </div>
           )}
 
-          {/* Fill palette */}
           {['rect','circle','triangle'].includes(tool)&&(
             <div style={{marginTop:8}}>
               <div style={{fontSize:10,color:'var(--text2)',marginBottom:4}}>Color de relleno</div>
@@ -1388,9 +1480,17 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
           </div>
         </div>
 
+        {/* Google Drive info */}
+        <div className="panel-section">
+          <div className="pn-title" style={{color:'var(--text2)'}}>Google Drive</div>
+          <div style={{fontSize:10,color:'var(--text2)',lineHeight:1.6}}>
+            Para guardar en Drive automáticamente necesitas una <b>API Key de Google</b>. Exporta el PNG y súbelo manualmente por ahora. <a href="https://console.cloud.google.com" target="_blank" rel="noreferrer" style={{color:'var(--accent)'}}>Crear proyecto</a>
+          </div>
+        </div>
+
         {/* Footer */}
         <div className="panel-footer">
-          <strong>Drawdams v1.0</strong><br/>
+          <strong>Drawdams v1.1</strong><br/>
           Código abierto · Licencia MIT<br/>
           <a href="https://github.com/drawdams" target="_blank" rel="noreferrer">★ GitHub</a>
         </div>
@@ -1402,11 +1502,11 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
           <textarea ref={textAreaRef} className="text-area" rows={2}
             placeholder="Escribe… (Ctrl+Enter para confirmar)"
             style={{
-              fontSize:(textOverlayState.fontSize*vp.current.scale)+'px',
-              fontFamily:textOverlayState.fontFamily,
-              fontStyle:textOverlayState.fontStyle.includes('italic')?'italic':'normal',
-              fontWeight:textOverlayState.fontStyle.includes('bold')?'700':'400',
-              color:textOverlayState.stroke,
+              fontSize:(fontSz*vp.current.scale)+'px',
+              fontFamily:fontFam,
+              fontStyle:fontSt.includes('italic')?'italic':'normal',
+              fontWeight:fontSt.includes('bold')?'700':'400',
+              color:strokeColor,
             }}
             onKeyDown={handleTextKeyDown}/>
         </div>
@@ -1433,10 +1533,10 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
           <span className="sc-tag"><span className="key">D</span> Cambiar fondo</span>
           <span className="sc-tag"><span className="key">Ctrl+Z</span> Deshacer</span>
           <span className="sc-tag"><span className="key">Ctrl+Y</span> Rehacer</span>
-          <span className="sc-tag"><span className="key">Clic derecho / Espacio</span> Mover lienzo</span>
+          <span className="sc-tag"><span className="key">H</span> Mano / <span className="key">Espacio+Arrastrar</span> Mover lienzo</span>
+          <span className="sc-tag"><span className="key">Doble clic</span> Editar texto</span>
           <span className="sc-tag"><span className="key">Scroll</span> Zoom</span>
-          <span className="sc-tag"><span className="key">Ctrl+S</span> Guardar</span>
-          <span className="sc-tag"><span className="key">Shift</span> Proporciones</span>
+          <span className="sc-tag"><span className="key">Ctrl+V</span> Pegar imagen</span>
           <button className="sb-toggle" onClick={()=>setShowSB(false)} title="Ocultar">✕</button>
         </div>
       )}
@@ -1461,6 +1561,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
               <div className="sc-item"><span className="key">P</span>Lápiz</div>
               <div className="sc-item"><span className="key">E</span>Borrador</div>
               <div className="sc-item"><span className="key">V</span>Seleccionar</div>
+              <div className="sc-item"><span className="key">H</span>Mano (mover)</div>
               <div className="sc-item"><span className="key">T</span>Texto</div>
               <div className="sc-item"><span className="key">R</span>Rectángulo</div>
               <div className="sc-item"><span className="key">C</span>Círculo</div>
@@ -1468,16 +1569,17 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
               <div className="sc-item"><span className="key">A</span>Flecha</div>
               <div className="sc-item"><span className="key">G</span>Triángulo</div>
               <div className="sc-item"><span className="key">I</span>Subir imagen</div>
+              <div className="sc-item"><span className="key">Ctrl+V</span>Pegar imagen</div>
               <div className="sc-item"><span className="key">Ctrl Z</span>Deshacer</div>
               <div className="sc-item"><span className="key">Ctrl Y</span>Rehacer</div>
               <div className="sc-item"><span className="key">Ctrl S</span>Guardar</div>
               <div className="sc-item"><span className="key">Del</span>Eliminar selección</div>
+              <div className="sc-item"><span className="key">Doble clic</span>Editar texto</div>
               <div className="sc-item"><span className="key">Esc</span>Deseleccionar</div>
               <div className="sc-item"><span className="key">D</span>Cambiar fondo</div>
               <div className="sc-item"><span className="key">Rueda</span>Zoom</div>
-              <div className="sc-item"><span className="key">Clic derecho / Espacio</span>Paneo</div>
+              <div className="sc-item"><span className="key">Espacio+drag</span>Paneo</div>
               <div className="sc-item"><span className="key">Ctrl+Enter</span>Confirmar texto</div>
-              <div className="sc-item"><span className="key">Shift</span>Proporciones</div>
               <div className="sc-item"><span className="key">0</span>Restablecer vista</div>
             </div>
           </div>
