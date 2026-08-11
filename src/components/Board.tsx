@@ -97,6 +97,8 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
   const rHandle = useRef('');
   const rBBox = useRef<any>(null);
   const bgIdx = useRef(0);
+  const editTextIdx = useRef(-1);
+  const offCanvas = useRef<HTMLCanvasElement | null>(null);
 
   // State mirrors for canvas event handlers
   const toolR = useRef(tool);
@@ -341,14 +343,28 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
       ctx!.restore();
     }
 
-    // ── Full redraw (FIXED: background first, then elements directly on main ctx) ──
+    // ── Full redraw ──
+    // FIX: elements (incl. eraser) are rendered on a separate OFFSCREEN layer.
+    // The eraser's destination-out only cuts through that layer, never through
+    // the background. The background is always painted fresh underneath and
+    // shows through cleanly wherever the eraser cut a hole — a real erase,
+    // not a colored patch on top.
     function doRedraw(){
-      // 1. Draw the background (fills canvas with solid color + dots/grid)
+      let off = offCanvas.current;
+      if(!off){ off = document.createElement('canvas'); offCanvas.current = off; }
+      if(off.width!==canvas!.width || off.height!==canvas!.height){
+        off.width = canvas!.width; off.height = canvas!.height;
+      }
+      const octx = off.getContext('2d')!;
+      octx.clearRect(0,0,off.width,off.height);
+      // 1. Render all elements (and the in-progress one) onto the offscreen layer
+      els.current.forEach(el=>renderEl(octx,el));
+      if(cur.current) renderEl(octx,cur.current);
+      // 2. Paint the background fresh on the main canvas
       drawBg();
-      // 2. Draw all elements directly on the main canvas so eraser destination-out works
-      els.current.forEach(el=>renderEl(ctx!,el));
-      if(cur.current) renderEl(ctx!,cur.current);
-      // 3. Draw selection overlay on top
+      // 3. Composite the elements layer on top of the background
+      ctx!.drawImage(off,0,0);
+      // 4. Draw selection overlay on top of everything
       if(selIdxR.current>=0&&selIdxR.current<els.current.length)
         renderSel(els.current[selIdxR.current]);
     }
@@ -487,17 +503,33 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
 
     // ── Cursor ──
     function getCursor(){
-      const map:{[k:string]:string}={pen:'crosshair',eraser:'cell',select:'default',text:'text',line:'crosshair',arrow:'crosshair',rect:'crosshair',circle:'crosshair',triangle:'crosshair'};
+      const map:{[k:string]:string}={pen:'crosshair',eraser:'cell',select:'default',text:'text',line:'crosshair',arrow:'crosshair',rect:'crosshair',circle:'crosshair',triangle:'crosshair',pan:'grab'};
       return map[toolR.current]||'default';
     }
     setCursorFn.current=(c:string)=>{canvas!.style.cursor=c;};
 
-    // ── Commit text ──
+    // ── Commit text (creates new text, OR saves edits to an existing one) ──
     let textOverlayState = { cx:0, cy:0 };
     function commitText(){
       const ta=textAreaRef.current;
       if(!ta) return;
       const val=ta.value;
+      const idx=editTextIdx.current;
+
+      if(idx>=0&&idx<els.current.length){
+        // Editing an existing text element
+        pushUndo();
+        if(val.trim()){
+          els.current[idx].text=val;
+        } else {
+          els.current.splice(idx,1); // emptied out -> remove it
+        }
+        editTextIdx.current=-1;
+        selIdxR.current=-1; setSelIdx(-1);
+        doRedraw();
+        return;
+      }
+
       if(val.trim()){
         pushUndo();
         els.current.push({
@@ -509,6 +541,26 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
       }
     }
     commitTextFn.current=commitText;
+
+    // ── Open the text overlay to EDIT an existing text element ──
+    function openTextEditor(idx:number){
+      const el=els.current[idx];
+      if(!el||el.type!=='text') return;
+      editTextIdx.current=idx;
+      setTool('text'); toolR.current='text';
+      const wr=wrap!.getBoundingClientRect();
+      const pos=c2s(el.x!,el.y!);
+      textOverlayState={cx:el.x!,cy:el.y!};
+      setTextOverlay({left:pos.x+wr.left,top:pos.y+wr.top,cx:el.x!,cy:el.y!});
+      setTimeout(()=>{
+        const ta=textAreaRef.current;
+        if(ta){
+          ta.value=el.text??'';
+          ta.focus();
+          ta.select();
+        }
+      },10);
+    }
 
     // ── Reset view ──
     function resetView(){
@@ -604,7 +656,10 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
       canvas!.setPointerCapture(e.pointerId);
       const {sx,sy,x,y}=ptr(e);
 
-      if(e.button===1||(e.button===0&&spaceDown.current)){
+      // Pan: middle-click, Space+drag, OR the dedicated "hand" tool with a
+      // plain left click — this is what makes the infinite board actually
+      // draggable without holding any key.
+      if(e.button===1||(e.button===0&&spaceDown.current)||(e.button===0&&toolR.current==='pan')){
         isPanning.current=true;
         panOrigin.current={x:sx-vp.current.x,y:sy-vp.current.y};
         canvas!.style.cursor='grabbing'; return;
@@ -637,6 +692,15 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
       }
 
       if(toolR.current==='text'){
+        // Clicking on top of an existing text element edits it instead of
+        // creating a new overlapping one.
+        for(let i=els.current.length-1;i>=0;i--){
+          if(els.current[i].type==='text'&&hitTest(els.current[i],x,y)){
+            openTextEditor(i);
+            return;
+          }
+        }
+        editTextIdx.current=-1;
         const sc=c2s(x,y);
         const wr=wrap!.getBoundingClientRect();
         textOverlayState={cx:x,cy:y};
@@ -752,6 +816,23 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
       doRedraw();
     }
 
+    // ═══ DOUBLE-CLICK: edit an existing text element ═══
+    // FIX: this is what lets you re-open a text box and correct it — works
+    // whether you're on the "select" tool or the "text" tool.
+    function onDblClick(e:MouseEvent){
+      if(toolR.current!=='select'&&toolR.current!=='text') return;
+      const r=canvas!.getBoundingClientRect();
+      const sx=e.clientX-r.left, sy=e.clientY-r.top;
+      const {x,y}=s2c(sx,sy);
+      for(let i=els.current.length-1;i>=0;i--){
+        if(els.current[i].type==='text'&&hitTest(els.current[i],x,y)){
+          selIdxR.current=i; setSelIdx(i);
+          openTextEditor(i);
+          return;
+        }
+      }
+    }
+
     // ═══ WHEEL ZOOM ═══
     function onWheel(e:WheelEvent){
       e.preventDefault();
@@ -786,7 +867,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
         return;
       }
 
-      const toolKeys:{[k:string]:string}={p:'pen',e:'eraser',v:'select',t:'text',r:'rect',c:'circle',l:'line',a:'arrow',g:'triangle'};
+      const toolKeys:{[k:string]:string}={p:'pen',e:'eraser',v:'select',t:'text',r:'rect',c:'circle',l:'line',a:'arrow',g:'triangle',h:'pan'};
       if(toolKeys[e.key.toLowerCase()]){setTool(toolKeys[e.key.toLowerCase()]);return;}
 
       switch(e.key.toLowerCase()){
@@ -837,6 +918,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
     canvas.addEventListener('pointermove',onPointerMove);
     canvas.addEventListener('pointerup',onPointerUp);
     canvas.addEventListener('pointercancel',onPointerUp);
+    canvas.addEventListener('dblclick',onDblClick);
     canvas.addEventListener('wheel',onWheel,{passive:false});
     document.addEventListener('keydown',onKeyDown);
     document.addEventListener('keyup',onKeyUp);
@@ -869,6 +951,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
       canvas.removeEventListener('pointermove',onPointerMove);
       canvas.removeEventListener('pointerup',onPointerUp);
       canvas.removeEventListener('pointercancel',onPointerUp);
+      canvas.removeEventListener('dblclick',onDblClick);
       canvas.removeEventListener('wheel',onWheel);
       document.removeEventListener('keydown',onKeyDown);
       document.removeEventListener('keyup',onKeyUp);
@@ -886,7 +969,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
   const handleToolChange = useCallback((t:string)=>{
     setTool(t); toolR.current=t;
     if(t!=='text'&&textOverlay){commitTextFn.current();setTextOverlay(null);}
-    const cursors:{[k:string]:string}={pen:'crosshair',eraser:'cell',select:'default',text:'text',line:'crosshair',arrow:'crosshair',rect:'crosshair',circle:'crosshair',triangle:'crosshair'};
+    const cursors:{[k:string]:string}={pen:'crosshair',eraser:'cell',select:'default',text:'text',line:'crosshair',arrow:'crosshair',rect:'crosshair',circle:'crosshair',triangle:'crosshair',pan:'grab'};
     setCursorFn.current(cursors[t]||'default');
   },[textOverlay]);
 
@@ -1017,7 +1100,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
   },[]);
 
   const handleTextKeyDown = useCallback((e:React.KeyboardEvent<HTMLTextAreaElement>)=>{
-    if(e.key==='Escape'){setTextOverlay(null);e.stopPropagation();}
+    if(e.key==='Escape'){setTextOverlay(null);editTextIdx.current=-1;e.stopPropagation();}
     if(e.key==='Enter'&&(e.ctrlKey||e.metaKey)){
       e.preventDefault();
       commitTextFn.current();
@@ -1111,7 +1194,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
   // ══════════════════════════════════════════════════════════════
   // RENDER
   // ══════════════════════════════════════════════════════════════
-  const toolIcons:{[k:string]:string}={pen:'✏️',eraser:'🧹',select:'🖱️',text:'T',line:'╱',arrow:'→',rect:'▭',circle:'○',triangle:'△'};
+  const toolIcons:{[k:string]:string}={pen:'✏️',eraser:'🧹',select:'🖱️',text:'T',pan:'✋',line:'╱',arrow:'→',rect:'▭',circle:'○',triangle:'△'};
   const toolLabel=(t:string)=>(toolIcons[t]||'')+' '+t.charAt(0).toUpperCase()+t.slice(1);
 
   return (
@@ -1132,6 +1215,10 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
         <button className={`tb-btn ${tool==='select'?'active':''}`} onClick={()=>handleToolChange('select')} aria-label="Seleccionar">
           <svg viewBox="0 0 24 24"><path d="M5 3l14 9-7 1-3 7z"/></svg>
           <span className="tip">Seleccionar <kbd>V</kbd></span>
+        </button>
+        <button className={`tb-btn ${tool==='pan'?'active':''}`} onClick={()=>handleToolChange('pan')} aria-label="Mano (mover lienzo)">
+          <svg viewBox="0 0 24 24"><path d="M18 11V6a2 2 0 00-2-2 2 2 0 00-2 2"/><path d="M14 10V4a2 2 0 00-2-2 2 2 0 00-2 2v2"/><path d="M10 10.5V6a2 2 0 00-2-2 2 2 0 00-2 2v8"/><path d="M18 8a2 2 0 114 0v6a8 8 0 01-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-4.19a2 2 0 012.83-2.82L7 15"/></svg>
+          <span className="tip">Mano <kbd>H</kbd></span>
         </button>
         <button className={`tb-btn text-icon ${tool==='text'?'active':''}`} onClick={()=>handleToolChange('text')} aria-label="Texto">
           T
@@ -1446,7 +1533,8 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
           <span className="sc-tag"><span className="key">D</span> Cambiar fondo</span>
           <span className="sc-tag"><span className="key">Ctrl+Z</span> Deshacer</span>
           <span className="sc-tag"><span className="key">Ctrl+Y</span> Rehacer</span>
-          <span className="sc-tag"><span className="key">Espacio+Arrastrar</span> Mover lienzo</span>
+          <span className="sc-tag"><span className="key">H</span> Mano / <span className="key">Espacio+Arrastrar</span> Mover lienzo</span>
+          <span className="sc-tag"><span className="key">Doble clic</span> Editar texto</span>
           <span className="sc-tag"><span className="key">Scroll</span> Zoom</span>
           <span className="sc-tag"><span className="key">Ctrl+V</span> Pegar imagen</span>
           <button className="sb-toggle" onClick={()=>setShowSB(false)} title="Ocultar">✕</button>
@@ -1473,6 +1561,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
               <div className="sc-item"><span className="key">P</span>Lápiz</div>
               <div className="sc-item"><span className="key">E</span>Borrador</div>
               <div className="sc-item"><span className="key">V</span>Seleccionar</div>
+              <div className="sc-item"><span className="key">H</span>Mano (mover)</div>
               <div className="sc-item"><span className="key">T</span>Texto</div>
               <div className="sc-item"><span className="key">R</span>Rectángulo</div>
               <div className="sc-item"><span className="key">C</span>Círculo</div>
@@ -1485,6 +1574,7 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
               <div className="sc-item"><span className="key">Ctrl Y</span>Rehacer</div>
               <div className="sc-item"><span className="key">Ctrl S</span>Guardar</div>
               <div className="sc-item"><span className="key">Del</span>Eliminar selección</div>
+              <div className="sc-item"><span className="key">Doble clic</span>Editar texto</div>
               <div className="sc-item"><span className="key">Esc</span>Deseleccionar</div>
               <div className="sc-item"><span className="key">D</span>Cambiar fondo</div>
               <div className="sc-item"><span className="key">Rueda</span>Zoom</div>
@@ -1501,3 +1591,4 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
     </div>
   );
 }
+
