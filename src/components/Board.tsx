@@ -1591,4 +1591,3 @@ export default function Board({ user, onLogout }: { user: UserData; onLogout: ()
     </div>
   );
 }
-
